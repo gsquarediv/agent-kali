@@ -1,0 +1,113 @@
+name: Build image
+
+on:
+  schedule:
+    - cron: "59 23 * * *"
+  workflow_dispatch:
+    inputs:
+      opencode_version:
+        description: "OpenCode version to build (empty = latest)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository_owner }}/agent-kali
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      matrix: ${{ steps.check.outputs.matrix }}
+    steps:
+      - name: Resolve OpenCode version
+        id: version
+        run: |
+          set -euo pipefail
+          input="${{ github.event.inputs.opencode_version }}"
+          if [ -n "$input" ]; then
+            version="${input#v}"
+          else
+            version="$(curl -fsSL --compressed \
+              -H 'Accept: application/json' \
+              https://api.github.com/repos/anomalyco/opencode/releases/latest \
+              | jq -r '.tag_name | sub("^v"; "")')"
+          fi
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "Failed to resolve OpenCode version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved OpenCode version: $version"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine targets needing build
+        id: check
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          targets=()
+          for t in slim toolbox; do
+            tag="${REGISTRY}/${IMAGE}:v${VERSION}-${t}"
+            if docker buildx imagetools inspect "$tag" >/dev/null 2>&1; then
+              echo "Already published, skipping: $tag"
+            else
+              echo "Needs build: $tag"
+              targets+=("$t")
+            fi
+          done
+          matrix=$(printf '%s\n' "${targets[@]:-}" \
+            | jq -R . | jq -sc 'map(select(. != "" and . != "null")) | map({target: .})')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: detect
+    if: needs.detect.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile
+          target: ${{ matrix.target }}
+          push: true
+          build-args: |
+            OPENCODE_VERSION=${{ needs.detect.outputs.version }}
+            BASE_IMAGE=kali-last-release
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,scope=${{ matrix.target }},mode=max
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:v${{ needs.detect.outputs.version }}-${{ matrix.target }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.target }}
+          provenance: false # Disable provenance to avoid unknown/unknown
+          sbom: false       # Disable sbom to avoid unknown/unknown
