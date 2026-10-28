@@ -8,7 +8,7 @@ RUN <<EOT
 set -eux
 apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   ca-certificates curl git ripgrep jq \
-  chromium-headless-shell \
+  chromium-headless-shell python3-minimal \
   bash-completion less tealdeer
 tldr --update
 rm -rf /var/lib/apt/lists/*
